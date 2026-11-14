@@ -14,6 +14,8 @@
    - [2.1 Client tools vs server tools](#21-client-tools-vs-server-tools)
    - [2.2 Anthropic-defined client tools](#22-anthropic-defined-client-tools)
    - [2.3 `is_error` & recovery](#23-is_error--recovery)
+   - [2.4 Configuring server tools (web_search / web_fetch)](#24-configuring-server-tools-web_search--web_fetch)
+   - [2.5 Strict tool use (`strict: true`)](#25-strict-tool-use-strict-true)
 3. [MCP — the Model Context Protocol](#3-mcp--the-model-context-protocol)
    - [3.1 What it is & why it exists](#31-what-it-is--why-it-exists)
    - [3.2 Architecture: host / client / server](#32-architecture-host--client--server)
@@ -150,6 +152,54 @@ When a tool call fails, don't fake a success — tell Claude. Set **`is_error: t
 - Return **structured error info** (what failed + why) so the model can self-correct (ties to the failure-handling guidance in Domain 1).
 - MCP tool results carry the **same idea** (`isError` / `is_error`), so recovery works the same across API tools and MCP tools.
 
+### 2.4 Configuring server tools (web_search / web_fetch)
+Server tools take **configuration fields on the tool entry** — a favourite *"how do you restrict / limit it?"* scenario. For **`web_search`** (verified):
+
+```jsonc
+{
+  "type": "web_search_20250305",          // dated type; newer: _20260209, _20260318
+  "name": "web_search",
+  "max_uses": 5,                          // cap searches per turn (failed ones count; over → max_uses_exceeded)
+  "allowed_domains": ["example.com"],     // ONLY these domains …
+  // "blocked_domains": ["spam.com"],     // … OR never these — not both (both → 400)
+  "user_location": {                      // localise results
+    "type": "approximate",               // must be "approximate"
+    "city": "San Francisco", "region": "California",
+    "country": "US",                      // ISO 3166-1 alpha-2
+    "timezone": "America/Los_Angeles"     // IANA tz
+  }
+}
+```
+- **Limit how many searches** per turn → **`max_uses`** (exceeding returns a `web_search_tool_result` error `max_uses_exceeded`).
+- **Restrict to a domain allowlist** → **`allowed_domains`**; **exclude** domains → **`blocked_domains`**. Use **one or the other, never both** (both → **400**). Domains are **bare** (`example.com` or `example.com/blog`), **no scheme**.
+- **Localise results** → **`user_location`** (`approximate` + any of city/region/country/timezone).
+- **`web_fetch`** takes a similar **`max_uses`** cap. The dated **`type`** string advances with capability (`web_search_20250305` basic → `_20260209` dynamic filtering → `_20260318` adds `response_inclusion`).
+
+> **Trap:** to keep a research agent on trusted sources, the answer is **`allowed_domains`** on the `web_search` tool — not a prompt instruction ("only use these sites"), which the model can ignore. Same spirit as least privilege (Domain 7).
+
+### 2.5 Strict tool use (`strict: true`)
+Set **`strict: true`** on a tool definition to **guarantee** Claude's **tool-call arguments** match your `input_schema` — it constrains token sampling to schema-valid output (**grammar-constrained sampling**). Without it, the schema is only *guidance*: Claude usually follows it but can send the **wrong type** (`"2"` or `"two"` instead of `2`), **omit a required field**, or add an extra one — breaking your function.
+
+```python
+tools=[{
+  "name": "get_weather",
+  "description": "Get the current weather in a location",
+  "strict": True,                          # ← grammar-constrained, schema-valid inputs
+  "input_schema": {
+    "type": "object",
+    "properties": {"location": {"type": "string"}},
+    "required": ["location"],
+    "additionalProperties": False          # strict schemas pin this down
+  }
+}]
+```
+
+- **Guarantees:** `tool_use.input` strictly follows your schema, **and** the tool `name` is always a real tool (never hallucinated).
+- **≠ `output_config.format`:** `strict` constrains **tool-call inputs**; `output_config.format` constrains the **response text** (Domain 6 §2.7). Same grammar engine, different target.
+- **≠ `tool_choice`:** `tool_choice` forces **whether / which** tool is called; `strict` governs **whether the arguments are valid**. (A prompt instruction is only a nudge — not a guarantee of either.)
+- **Caveats (verified):** only a **subset of JSON Schema** is allowed; the **`computer` / `browser` toolsets reject `strict: true`** (→ 400); compiled schemas are **cached up to ~24 h**, so **keep PHI out of the schema** (property names, `enum`/`const`, `pattern`) — put it only in message content.
+- **Supported** across current models (4.5 / 4.6 / 5.x), **stable, no beta header**.
+
 ---
 
 ## 3. MCP — the Model Context Protocol
@@ -279,16 +329,20 @@ A connected server can expose powerful actions and returns **untrusted content**
 - Q: Signal a failed tool call? **A:** `is_error: true` in the `tool_result`.
 - Q: Client vs server tools? **A:** Client run in **your app** (round-trip `tool_result`); server tools (`web_search`, `web_fetch`, `code_execution`, `tool_search`) run on **Anthropic's infra** (results returned directly, can `pause_turn`).
 - Q: Are `bash`/`text_editor`/`computer` server tools? **A:** **No** — Anthropic-defined **client** tools; your app executes them.
+- Q: Guarantee a tool is called with schema-valid, correctly-typed arguments? **A:** **`strict: true`** on the tool (grammar-constrained). Contrast: **`tool_choice`** forces *whether/which* tool; **`output_config.format`** constrains the *response*, not tool inputs.
 - Q: What does MCP stand for / what is it? **A:** **Model Context Protocol** — an open standard ("USB-C for AI") connecting apps to tools/data/prompts.
 - Q: MCP architecture pieces & the client↔server relationship? **A:** **Host → Client → Server**; one host, many clients→servers; each **client↔server is 1:1**.
 - Q: What RPC format does MCP use? **A:** **JSON-RPC 2.0**.
 - Q: Three MCP **server** primitives + who controls each? **A:** **Tools** (model), **Resources** (app), **Prompts** (user).
 - Q: Name a **client** primitive, and one that's deprecated. **A:** **Elicitation** (current); **sampling** (and logging) **deprecated** as of spec 2026-07-28.
+- Q: Map these to MCP primitives: a slash-command "draft postmortem" workflow; a host-attached read-only incident timeline; a model-decided "page the team" action. **A:** **prompt** (user-controlled, slash command), **resource** (app-controlled context by URI), **tool** (model-controlled action). Mnemonic: **prompt = user, resource = app, tool = model.**
+- Q: A plugin depends on another by name (`"dependencies": ["x"]`) and a breaking **x 3.0.0** broke everyone — keep users on 2.x fixes only? **A:** Pin a **semver range**: `{"name":"x","version":"^2.0"}`; Claude Code resolves it against git tags **`<name>--v<version>`**. (Bumping your *own* version, disabling auto-update by hand, or vendoring the server in are the traps.)
 - Q: Two live MCP transports + the legacy one? **A:** **stdio** (local) & **Streamable HTTP** (remote); **HTTP+SSE** is legacy.
 - Q: How do you attach a remote MCP server to a Messages API call? **A:** The **MCP connector** (beta): `mcp_servers` (url + `authorization_token`) + an `mcp_toolset` in `tools`.
 - Q: Can the API MCP connector use a local stdio server? **A:** **No** — remote HTTP only; and **only tool calls** are supported.
 - Q: In Claude Code, how do MCP prompts appear? **A:** As **slash commands** (tools appear as callable tools).
 - Q: Is MCP tool output trusted? **A:** **No** — treat it as untrusted (indirect-injection risk); screen + least privilege + human-in-the-loop for sensitive actions.
+- Q: Restrict `web_search` to trusted sites / limit the number of searches? **A:** **`allowed_domains`** (or `blocked_domains` — not both) and **`max_uses`** on the tool entry; `user_location` localises results. A prompt instruction is not a real restriction.
 - Q: Why use MCP at all? **A:** Build an integration **once** as a server; reuse across any MCP client — no per-app glue.
 
 **One-line summary:** *Tools = `name` + `description` + `input_schema`; Claude **requests** (`stop_reason:"tool_use"`), **you execute** client tools and return a `tool_result` in a **user** message (match `tool_use_id`, flag failures with `is_error`) — while **server tools** run on Anthropic's infra; `tool_choice` = auto/any/tool/none. **MCP** is the open standard (JSON-RPC 2.0) with a **Host→Client→Server** (1:1) architecture exposing **Tools/Resources/Prompts** over **stdio** or **Streamable HTTP**, reachable from the API via the remote-only **MCP connector**.*

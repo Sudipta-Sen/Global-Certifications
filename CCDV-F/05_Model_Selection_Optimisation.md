@@ -15,6 +15,7 @@
    - [2.3 Model routing](#23-model-routing)
    - [2.4 Reasoning levers: `effort` and thinking modes](#24-reasoning-levers-effort-and-thinking-modes)
    - [2.5 Other optimisation levers](#25-other-optimisation-levers)
+   - [2.6 Service tier / Priority Tier (reliability lever)](#26-service-tier--priority-tier-reliability--overload-lever)
 3. [Putting it together](#3-putting-it-together)
    - [3.1 Latency vs cost (they're different)](#31-latency-vs-cost-theyre-different)
    - [3.2 Lever cheat-sheet & decision flow](#32-lever-cheat-sheet--decision-flow)
@@ -262,6 +263,7 @@ On current models **thinking is always on**, so the question isn't *"should it t
 - **Adaptive thinking (current, recommended):** `thinking: {"type": "adaptive"}` with **no `budget_tokens`** — Claude **decides per request whether to think and how much**, and at low effort it may **skip thinking entirely on easy inputs**. Depth is set by **`output_config.effort`** (above). It interleaves between tool calls automatically (no beta header).
 - **Manual extended thinking is DEPRECATED (verified):** `thinking: {"type":"enabled","budget_tokens": N}` — **Claude 4.7 and later reject it with a 400 error.** It lingers only for workloads needing *predictable latency / precise cost control* on older models (4.6 and earlier), where it set a thinking-token budget (**min 1,024**, must be **< `max_tokens`**).
 - **Billing & window (either mode):** thinking tokens are billed as **output** and count toward `max_tokens` and the context window — track them via `usage.output_tokens_details.thinking_tokens` (Note 06 §4.1). For very deep thinking (budgets/effort in the **>32k** range) use **batch processing** to avoid timeouts.
+- **Tool-use loops — pass thinking back *verbatim* (verified):** to continue a tool-use turn with thinking on, echo the assistant turn back **unmodified — the full `content` array, including `thinking` *and* `redacted_thinking` blocks.** Modifying or dropping them → **400 `invalid_request_error`** ("thinking blocks cannot be modified"), and resending the same body fails again (it's a deterministic 400 — fix the body, don't retry). A filter that keeps only `thinking`/`text`/`tool_use` silently drops **`redacted_thinking`** (present only when part of the reasoning is safety-redacted → a *rare, intermittent* failure). **Preserve exactly; don't strip.**
 
 > **Order of escalation for a too-hard task:** raise **`effort`** → (older models only) raise the manual **thinking budget** → only then **upgrade the tier**. Each step costs more, so climb only as far as the evals require.
 
@@ -270,6 +272,15 @@ On current models **thinking is always on**, so the question isn't *"should it t
 - **Prompt efficiency** — trim redundant context; shorter inputs cost less (but keep what quality needs).
 - **Streaming** — makes the reply *feel* faster (tokens appear as they're generated) but **does not reduce cost or total generation time** — it improves **perceived** latency only.
 - **Choose the smallest model that passes evals** — the headline lever (see §1.3).
+- **Long outputs → stream or batch** so they don't hit the SDK's **10-min** non-streaming timeout (Note 02 §7). Not a cost lever — a *reliability* one.
+
+### 2.6 Service tier / Priority Tier (reliability & overload lever)
+When the problem is **"we get `529 overloaded` / latency spikes at peak,"** the lever isn't a smaller model — it's **capacity tier** (verified):
+- **`service_tier` request param:** **`"auto"`** (default — use Priority Tier capacity if available, else fall back to standard) or **`"standard_only"`** (never touch Priority capacity). The response reports what it got in **`usage.service_tier`** (e.g. `"priority"`).
+- **Priority Tier** = committed input/output tokens-per-minute capacity that the API **prioritises over other requests**, minimising "server overloaded" errors even at peak (targets ~99.5% uptime). It's a **reliability/throughput** guarantee, **not** a latency SLA. Over-capacity requests **fall back to standard**.
+- **Buying it:** new Priority Tier **commitments are no longer sold** (existing contracts run to term; "contact sales" for guaranteed capacity) — so on the exam treat it as the **concept**: the way to harden against overload is **committed/priority capacity + `service_tier`**, plus graceful **429/529 backoff** (Note 02 §7), not a model swap.
+
+> **Exam cue:** "peak-time `529`s / need reliable throughput" → **Priority Tier / `service_tier`** (+ backoff), *not* "use Haiku." Model choice is about capability/cost/latency; **tier is about capacity/reliability.**
 
 ---
 
@@ -343,5 +354,6 @@ Some scenarios ask about **speed**, not money — don't conflate:
 - Q: Adaptive vs manual thinking? **A:** **Adaptive** (`thinking:{type:"adaptive"}`, depth via `effort`) — Claude decides whether/how much to think, skipping it on easy inputs; **manual** (`type:"enabled"`+`budget_tokens`) is **deprecated**, rejected by 4.7+ with a 400.
 - Q: Is the **router** itself an expensive call? **A:** **No** — it's a cheap, well-scoped **classification** call (a great **Haiku** job).
 - Q: Does a cache **hit** refresh the TTL? **A:** **Yes** — each hit refreshes the 5-min (or 1-hr) TTL **for free**.
+- Q: Peak-time `529 overloaded` errors / need reliable throughput — which lever? **A:** **Capacity tier**, not a smaller model: **Priority Tier** (committed capacity, prioritised → ~99.5% uptime) selected via **`service_tier: "auto"`** (`standard_only` to opt out), plus **429/529 backoff**. Tier = capacity/reliability; model = capability/cost/latency.
 
 **One-line summary:** *Right-size the tier (Haiku → Sonnet → Opus → Fable ceiling) **by evals**; tune **`effort`** (adaptive thinking; manual `budget_tokens` is deprecated) before switching models; **cache** static prefixes (write 1.25×/2×, read 0.1×/0.05×/0.025×, hit = `cache_read_input_tokens`), **batch** bulk async (50% off, most <1h / 24h cap), **stream** for feel (not cost), and **route** easy vs hard inputs.*

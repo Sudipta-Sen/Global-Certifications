@@ -334,6 +334,8 @@ What each key does:
 
 > **Precedence (highest → lowest):** managed/enterprise → CLI flags → `.claude/settings.local.json` → `.claude/settings.json` (project) → `~/.claude/settings.json` (user).
 
+> **⚠️ That order is for *scalar* settings — permissions work differently (high-value trap).** Permission **rules don't override; they *merge* (union) across every scope.** Then **rule *type* decides, not the file**: evaluation is **`deny` → `ask` → `allow`**, with **`deny` checked first and winning from *any* scope.** So an **`allow` in `settings.local.json` canNOT cancel a `deny` in the committed `.claude/settings.json`** — both survive the merge and `deny` wins → the command is **blocked, no prompt** (it does *not* "resolve to ask"). This is deliberate: a committed `deny` is a guardrail that an individual's local `allow` must never be able to defeat. File precedence only settles a single-valued key (e.g. `model`); it never lets `allow` beat `deny`.
+
 ### Plan mode vs direct execution
 Claude Code always runs in a **permission mode** — the setting that decides what it can do **without asking you first**. The exam-relevant split: **plan mode = research & propose, make *no* changes**; the other modes = **direct execution** (Claude edits/runs, with or without prompts).
 
@@ -590,6 +592,9 @@ Because the subagent starts fresh, everything it needs must be in the skill (and
 - `CLAUDE.md` is **auto-loaded context**, not a build file or a secrets store. **Never put API keys in it.**
 - Hooks run **your** commands deterministically — they're not model behaviour.
 - `PreToolUse` can **prevent** an action; `PostToolUse` reacts **after**.
+- **`Stop` hook to force-continue (verified):** a `Stop` hook runs when the agent tries to *finish*. Return **`decision: "block"` + `reason`** to prevent the stop and tell Claude why to keep going (e.g. "pytest still red"). Guard the loop with **`stop_hook_active`** (plus Claude Code's cap on consecutive continuations) so it can't run forever. This *enforces* "don't finish until green" — a system prompt or a higher `max_turns` does **not** (the agent is *choosing* to stop, not running out of turns). A `PostToolUse` hook only *informs* after an edit; it never stops the turn ending.
+- **Hook matcher for MCP tools (verified):** MCP tools are named **`mcp__<server>__<tool>`** (double underscores), and hook matchers match as an **exact string** — so `mcp__warehouse` matches *no* tool and the hook never fires. Use the wildcard **`mcp__<server>__*`** (or the full tool name). MCP tools do **not** run through the built-in `Bash` tool, and only **`PreToolUse`** can block *before* execution (`PostToolUse` is too late).
+- **Agent SDK isolation (verified):** by default the SDK loads filesystem config (stray `CLAUDE.md`, rules) and **auto-memory**. To make behaviour come *only* from app code: pass **`settingSources: []`** (load no filesystem settings) and supply instructions via the **`systemPrompt`** option; and set **`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`** in the `env` option to stop cross-session memory. `mcpServers: {}` is a **wrong-knob** trap — MCP isn't the source of the CLAUDE.md rules or the memories; a prose "ignore other files" `CLAUDE.md` is advisory.
 
 ---
 
@@ -600,6 +605,7 @@ Because the subagent starts fresh, everything it needs must be in the skill (and
 - Q: Hook that runs before a tool call and can block it? **A:** `PreToolUse`.
 - Q: How does a hook block an action? **A:** Exit **`2`** (blocking error), or exit 0 and print JSON — `PreToolUse`: `permissionDecision:"deny"`; others: `decision:"block"`. (Exit 2 always wins over a JSON `allow`.)
 - Q: Three config levels of a hook + what `matcher` does? **A:** **event → matcher group → handler** (`{type:"command", command:…}`); `matcher` filters which tool fires it (`"*"`/exact/`|`-list/regex).
+- Q: Does an `allow` in `settings.local.json` override a `deny` in the committed project `settings.json`? **A:** **No.** Permission lists **merge across scopes**, and **`deny` beats `allow` from any scope** (order `deny`→`ask`→`allow`) → **blocked, no prompt**. File precedence only decides scalar keys (e.g. `model`), not allow-vs-deny.
 - Q: How does Claude Code gain extra external tools? **A:** By connecting MCP servers.
 - Q: How do you keep a `CLAUDE.md` modular? **A:** Use `@path` imports to pull in topic files (relative-to-file paths; up to 4 hops; organises but doesn't cut context cost).
 - Q: How do you load an instruction **only when Claude touches certain files**? **A:** A path-scoped rule in `.claude/rules/` with a `paths:` glob (e.g. `src/api/**/*.ts`) — it loads on Read/Write/Edit of a matching file (or a `cat`/`head`/**`grep`**/`rg` that counts as a read), not at launch.
